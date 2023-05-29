@@ -1,0 +1,86 @@
+#!/bin/bash
+
+DOMAIN_DNS="$(samba-tool domain info 127.0.0.1 | grep Domain | sed "s/.*: //")"
+DOMAIN_DN="DC=$(echo $DOMAIN_DNS | sed "s/\./,DC=/g" | sed "s/,DC=$//")"
+COMPUTERS_BASE_DN=${1:-$DOMAIN_DN} # "DC=domain,DC=alt"
+COMPUTERS_LIST="$(samba-tool computer list -b "$COMPUTERS_BASE_DN")"
+OBJECT_BASE_DN="DC=$DOMAIN_DNS,CN=MicrosoftDNS,DC=DomainDnsZones,$DOMAIN_DN"
+
+show_usage() {
+    echo "The utility sets the rights for machines in a domain to update their DNS records."
+    echo ""
+    echo "Usage: $PROG [options] [<check/test-function-name>]"
+    echo ""
+    echo "<check/test-function-name> must be a function name from the list of tests"
+    echo ""
+    echo "Options:"
+    echo "  -h, --help                  This message"
+    echo "  -V, --version                       Display version number"
+    echo "  -v, --verbose                       Verbose output"
+    echo "  -w, --logfile[=FILE]                Write verbose output to file"
+    echo "  -f, --force                 Force logging to existing file"
+    echo "  -l, --list                  List of tests"
+    echo ""
+    exit 0;
+}
+
+print_version() {
+    echo "$VERSION"
+    exit 0;
+}
+
+TEMP=$(getopt -n "$PROG" -o "v,V,w::,f,l,h" -l "verbose,version,logfile::,force,list,help" -- "$@") || show_usage
+eval set -- "$TEMP"
+
+while :; do
+    case "$1" in
+        -h|--help) show_usage
+            ;;
+        -v|--verbose) verbose=1
+            ;;
+        -w|--logfile) shift
+             test -n "$1" && logfile="$1" || logfile="domain-diag.log"
+            ;;
+        -f|--force) force=1
+            ;;
+        -l|--list) listcmd=1
+            ;;
+        -V|--version) print_version "$PROG"
+            ;;
+        --) shift; break
+            ;;
+        *) fatal "Unrecognized option: $1"
+            ;;
+    esac
+    shift
+done
+
+echo "Domain: $DOMAIN_DN"
+echo "Computers search base DN: $COMPUTERS_BASE_DN"
+echo "Selected computers list:"
+echo $COMPUTERS_LIST | tr ' ' '\n'
+
+read -p "Allow self nsupdate for this computers list? (Y/n): " -n 1 -r
+if [[ $REPLY != "" ]]; then
+    echo
+fi
+if [[ $REPLY =~ ^[Yy]$ || $REPLY == "" ]]; then
+    for computer in $COMPUTERS_LIST; do
+        computer_sid="$(samba-tool computer show "$computer" | \
+            grep "objectSid:" | sed "s/.*: //")"
+        ret=0
+        samba-tool dsacl set \
+            --objectdn="DC=${computer::-1},$OBJECT_BASE_DN" \
+            --action=allow \
+            --sddl="(A;;RPWPCRCCDCLCLORCWOWDSDDTSW;;;$computer_sid)" \
+            >/dev/null || ret=1
+        echo -e -n "$computer\t\t\t$computer_sid\t"
+        if [[ $ret == 0 ]]; then
+            echo "DONE"
+        else
+            echo "FAIL"
+        fi
+    done
+else
+    echo "Aborted"
+fi
