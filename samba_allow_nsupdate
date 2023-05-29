@@ -12,7 +12,7 @@ DOMAIN_DN=
 
 # common options
 PROG_NAME="samba_allow_nsupdate"
-VERSION="0.1"
+VERSION="0.9"
 VERBOSE=
 YES=
 
