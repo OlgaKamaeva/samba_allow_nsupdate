@@ -1,51 +1,101 @@
 #!/bin/bash
+set -euo pipefail
 
-DOMAIN_DNS="$(samba-tool domain info 127.0.0.1 | grep Domain | sed "s/.*: //")"
-DOMAIN_DN="DC=$(echo $DOMAIN_DNS | sed "s/\./,DC=/g" | sed "s/,DC=$//")"
-COMPUTERS_BASE_DN=${1:-$DOMAIN_DN} # "DC=domain,DC=alt"
-COMPUTERS_LIST="$(samba-tool computer list -b "$COMPUTERS_BASE_DN")"
-OBJECT_BASE_DN="DC=$DOMAIN_DNS,CN=MicrosoftDNS,DC=DomainDnsZones,$DOMAIN_DN"
+# shellcheck source=/bin/shell-getopt
+. shell-getopt
+
+# main options
+ACTION="allow"
+COMPUTERS_BASE_DN=
+DOMAIN_DNS=
+DOMAIN_DN=
+
+# common options
+PROG_NAME="samba_allow_nsupdate"
+VERSION="0.1"
+VERBOSE=
+YES=
+
+# internal vars
+OBJECT_BASE_DN=
+COMPUTERS_LIST_PARAMS=
 
 show_usage() {
-    echo "The utility sets the rights for machines in a domain to update their DNS records."
+    echo "$PROG_NAME utility sets the rights for computers in domain"
+    echo "to update their DNS records."
     echo ""
-    echo "Usage: $PROG [options] [<check/test-function-name>]"
+    echo "Usage: $PROG_NAME [options] [<computer-name/computer-sid>...]"
     echo ""
-    echo "<check/test-function-name> must be a function name from the list of tests"
+    echo "<computer-name/computer-sid>... list of computer names or SID's"
     echo ""
     echo "Options:"
-    echo "  -h, --help                  This message"
-    echo "  -V, --version                       Display version number"
-    echo "  -v, --verbose                       Verbose output"
-    echo "  -w, --logfile[=FILE]                Write verbose output to file"
-    echo "  -f, --force                 Force logging to existing file"
-    echo "  -l, --list                  List of tests"
+    echo "  -a, --action=ACTION                   Allow or deny"
+    echo "  -b, --computers-base-dn=BASE_DN       Base DN for search computers"
+    echo "  -n, --domain-dns=DOMAIN_DNS           Domain name"
+    echo "  -e, --domain-base-dn=DOMAIN_DN        Domain base DN"
+    echo ""
+    echo "  -h, --help                            This message"
+    echo "  -V, --version                         Display utility version"
+    echo "  -v, --verbose                         Verbose output"
+    echo "  -y, --yes                             Don't ask confirmation"
     echo ""
     exit 0;
 }
+
+OPTIONS_LIST="verbose,version,yes,help\
+              action:,computers-base-dn:,domain-dns:,domain-base-dn:"
+OPTIONS_SHORT_LIST="v,V,y,h,a:,b:,n:,e:"
+
+TEMP=$(getopt -n "$PROG_NAME" -o "$OPTIONS_SHORT_LIST" -l "$OPTIONS_LIST" -- "$@") || show_usage
+eval set -- "$TEMP"
 
 print_version() {
     echo "$VERSION"
     exit 0;
 }
 
-TEMP=$(getopt -n "$PROG" -o "v,V,w::,f,l,h" -l "verbose,version,logfile::,force,list,help" -- "$@") || show_usage
-eval set -- "$TEMP"
+invalid_option_msg() {
+    echo "Error: invalid option \"$1\""
+}
+
+set_action() {
+    [[ ${ACTION,,} =~ ^(allow|deny)$ ]] || (invalid_option_msg "action" && exit 1)
+    ACTION="${1,,}"
+}
+
+set_computers_base_dn() {
+    COMPUTERS_BASE_DN="$1"
+}
+
+set_domain_dns() {
+    DOMAIN_DNS="$1"
+}
+
+set_domain_base_dn() {
+    DOMAIN_DN="$1"
+}
 
 while :; do
     case "$1" in
         -h|--help) show_usage
             ;;
-        -v|--verbose) verbose=1
+        -v|--verbose) VERBOSE=1
             ;;
-        -w|--logfile) shift
-             test -n "$1" && logfile="$1" || logfile="domain-diag.log"
-            ;;
-        -f|--force) force=1
-            ;;
-        -l|--list) listcmd=1
+        -y|--yes) YES=1
             ;;
         -V|--version) print_version "$PROG"
+            ;;
+        -a|--action) shift
+            set_action "$1"
+            ;;
+        -b|--computers-base-dn) shift
+            set_computers_base_dn "$1"
+            ;;
+        -n|--domain-dns) shift
+            set_domain_dns "$1"
+            ;;
+        -e|--domain-base-dn) shift
+            set_domain_base_dn "$1"
             ;;
         --) shift; break
             ;;
@@ -55,32 +105,88 @@ while :; do
     shift
 done
 
-echo "Domain: $DOMAIN_DN"
-echo "Computers search base DN: $COMPUTERS_BASE_DN"
-echo "Selected computers list:"
-echo $COMPUTERS_LIST | tr ' ' '\n'
+COMPUTERS_LIST_PARAMS="$*"
 
-read -p "Allow self nsupdate for this computers list? (Y/n): " -n 1 -r
-if [[ $REPLY != "" ]]; then
-    echo
-fi
-if [[ $REPLY =~ ^[Yy]$ || $REPLY == "" ]]; then
-    for computer in $COMPUTERS_LIST; do
-        computer_sid="$(samba-tool computer show "$computer" | \
-            grep "objectSid:" | sed "s/.*: //")"
-        ret=0
-        samba-tool dsacl set \
-            --objectdn="DC=${computer::-1},$OBJECT_BASE_DN" \
-            --action=allow \
-            --sddl="(A;;RPWPCRCCDCLCLORCWOWDSDDTSW;;;$computer_sid)" \
-            >/dev/null || ret=1
-        echo -e -n "$computer\t\t\t$computer_sid\t"
-        if [[ $ret == 0 ]]; then
-            echo "DONE"
-        else
-            echo "FAIL"
-        fi
-    done
-else
-    echo "Aborted"
-fi
+generate_defaults() {
+    [ -z "$DOMAIN_DNS" ] && DOMAIN_DNS="$(samba-tool domain info 127.0.0.1 | grep Domain | sed "s/.*: //")"
+    [ -z "$DOMAIN_DN" ] && DOMAIN_DN="DC=$(echo "$DOMAIN_DNS" | sed "s/\./,DC=/g" | sed "s/,DC=$//")"
+    [ -z "$COMPUTERS_BASE_DN" ] && COMPUTERS_BASE_DN="$DOMAIN_DN" # "DC=domain,DC=alt"
+    OBJECT_BASE_DN="DC=$DOMAIN_DNS,CN=MicrosoftDNS,DC=DomainDnsZones,$DOMAIN_DN"
+}
+
+generate_computers_list() {
+    if [ -z "$1" ]; then
+        IFS=" " read -r -a COMPUTERS_LIST <<< "$(samba-tool computer list -b "$COMPUTERS_BASE_DN" | tr '\n' ' ')"
+    else
+        for c in $1; do
+            COMPUTERS_LIST+=("$(echo "$c" | sed -E 's/\$?$/$/')")
+        done
+    fi
+}
+
+checks() {
+    local ret=0
+    klist >/dev/null 2>&1 || ( echo "Error: administrator account kerberos ticket required" && exit 1)
+    samba-tool -V >/dev/null 2>&1 || ( echo "Error: samba-tool not installed" && exit 1)
+    samba-tool domain info 127.0.0.1 >/dev/null 2>&1 || ( echo "Error: not a domain controller" && exit 1)
+}
+
+header() {
+    echo "Domain: $DOMAIN_DNS"
+    echo "Domain DN: $DOMAIN_DN"
+    echo "Computers search base DN: $COMPUTERS_BASE_DN"
+    echo "Action: $ACTION"
+    echo "Selected computers list:"
+    echo "${COMPUTERS_LIST[@]}" | tr ' ' '\n'
+}
+
+ask() {
+    if [ -z $YES ]; then
+        read -p "Allow self nsupdate for this computers list? (Y/n): " -n 1 -r
+        [ "$REPLY" != "" ] && echo
+        [[ "$REPLY" =~ ^[Yy]$ || $REPLY == "" ]] && return 0 || return 1
+    else
+        return 0
+    fi
+}
+
+get_computer_sid() {
+    local computer="$1"
+    samba-tool computer show "$computer" | grep "objectSid:" | sed "s/.*: //"
+}
+
+set_dns_dsacl() {
+    local action="$1"
+    local computer_name="${2::-1}"
+    local computer_sid="$3"
+    samba-tool dsacl set \
+        --objectdn="DC=$computer_name,$OBJECT_BASE_DN" \
+        --action="$action" \
+        --sddl="(A;;RPWPCRCCDCLCLORCWOWDSDDTSW;;;$computer_sid)" \
+        >/dev/null
+}
+
+main() {
+    checks
+    generate_defaults
+    generate_computers_list "$COMPUTERS_LIST_PARAMS"
+    header
+
+    if ask; then
+        for computer in "${COMPUTERS_LIST[@]}"; do
+            ret=0
+            computer_sid="$(get_computer_sid "$computer")"
+            set_dns_dsacl "$ACTION" "$computer" "$computer_sid" || ret=1
+            echo -e -n "$computer\t\t\t$computer_sid\t"
+            if [[ $ret == 0 ]]; then
+                echo "DONE"
+            else
+                echo "FAIL"
+            fi
+        done
+    else
+        echo "Aborted"
+    fi
+}
+
+main
