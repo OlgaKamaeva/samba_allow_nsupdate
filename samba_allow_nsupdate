@@ -2,6 +2,8 @@
 set -euo pipefail
 
 # shellcheck source=/bin/shell-getopt
+# disable /bin/shell-getopt error
+# shellcheck disable=SC1091
 . shell-getopt
 
 # main options
@@ -75,6 +77,12 @@ set_domain_base_dn() {
     DOMAIN_DN="$1"
 }
 
+log_verbose() {
+    if [ -n "$VERBOSE" ]; then
+        echo "[VERBOSE] $1"
+    fi
+}
+
 while :; do
     case "$1" in
         -h|--help) show_usage
@@ -108,10 +116,12 @@ done
 COMPUTERS_LIST_PARAMS="$*"
 
 generate_defaults() {
+    log_verbose "Generating default values for DOMAIN_DNS and DOMAIN_DN..."
     [ -z "$DOMAIN_DNS" ] && DOMAIN_DNS="$(samba-tool domain info 127.0.0.1 | grep Domain | sed "s/.*: //")"
     [ -z "$DOMAIN_DN" ] && DOMAIN_DN="DC=$(echo "$DOMAIN_DNS" | sed "s/\./,DC=/g" | sed "s/,DC=$//")"
     [ -z "$COMPUTERS_BASE_DN" ] && COMPUTERS_BASE_DN="$DOMAIN_DN" # "DC=domain,DC=alt"
     OBJECT_BASE_DN="DC=$DOMAIN_DNS,CN=MicrosoftDNS,DC=DomainDnsZones,$DOMAIN_DN"
+    log_verbose "DOMAIN_DNS=$DOMAIN_DNS, DOMAIN_DN=$DOMAIN_DN, COMPUTERS_BASE_DN=$COMPUTERS_BASE_DN"
 }
 
 generate_computers_list() {
@@ -124,10 +134,14 @@ generate_computers_list() {
     fi
 }
 
+
 checks() {
     local ret=0
+    log_verbose "Checking for Kerberos ticket..."
     klist >/dev/null 2>&1 || ( echo "Error: administrator account kerberos ticket required" && exit 1)
+    log_verbose "Checking for samba-tool..."
     samba-tool -V >/dev/null 2>&1 || ( echo "Error: samba-tool not installed" && exit 1)
+    log_verbose "Checking if running on a domain controller..."
     samba-tool domain info 127.0.0.1 >/dev/null 2>&1 || ( echo "Error: not a domain controller" && exit 1)
 }
 
@@ -176,6 +190,7 @@ main() {
         for computer in "${COMPUTERS_LIST[@]}"; do
             ret=0
             computer_sid="$(get_computer_sid "$computer")"
+            log_verbose "Setting DNS dsacl for $computer with SID $computer_sid..."
             set_dns_dsacl "$ACTION" "$computer" "$computer_sid" || ret=1
             echo -e -n "$computer\t\t\t$computer_sid\t"
             if [[ $ret == 0 ]]; then
